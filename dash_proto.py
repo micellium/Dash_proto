@@ -400,6 +400,53 @@ class MclogCctRepository:
         finally:
             cursor.close()
 
+# --- Repositório para o Histórico de Jobs ---
+class JobRepository:
+    """
+    Gerencia a consulta ao histórico de jobs do SQL Server Agent.
+    """
+    def __init__(self, connection):
+        self._connection = connection
+
+    def _format_results(self, cursor) -> List[Dict[str, Any]]:
+        """Função auxiliar para formatar resultados do banco de dados."""
+        columns = [column[0] for column in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def get_job_history(self) -> List[Dict[str, Any]]:
+        """Busca o histórico do job 'Fechamento e Abertura do Sistema de Tesouraria/CC'."""
+        cursor = self._connection.cursor()
+        try:
+            sql_query = """
+                SELECT  
+                    j.name AS [JobName], 
+                    SUBSTRING(CAST(h.run_date AS VARCHAR(8)), 7, 2) + '-' + SUBSTRING(CAST(h.run_date AS VARCHAR(8)), 5, 2) + '-' + SUBSTRING(CAST(h.run_date AS VARCHAR(8)), 1, 4) AS RunDate,  -- Data da execução (formato DD-MM-YYYY)
+                    h.run_time AS RunTime,  -- Horário bruto (formato HHMMSS, pode ser ignorado)
+                    msdb.dbo.agent_datetime(h.run_date, h.run_time) AS RunDateTime, -- Data/hora real da execução
+                    STUFF(STUFF(RIGHT('000000' + CAST(h.run_duration AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':') AS RunDuration,  -- Duração do job (HHMMSS)
+                    CASE h.run_status  -- Status da execução (NÃO ALTERAR valores)
+                        WHEN 0 THEN 'Failed'
+                        WHEN 1 THEN 'Succeeded'
+                        WHEN 2 THEN 'Retry'
+                        WHEN 3 THEN 'Canceled'
+                        WHEN 4 THEN 'In Progress'
+                    END AS ExecutionStatus, 
+                    h.message AS SystemMessage  -- Mensagem de log retornada pelo SQL Agent
+                FROM msdb.dbo.sysjobs j
+                INNER JOIN msdb.dbo.sysjobhistory h
+                    ON j.job_id = h.job_id
+                WHERE h.step_id = 0   -- step_id = 0 = resultado consolidado do job (não de steps individuais)
+                  AND j.name = 'Fechamento e Abertura do Sistema de Tesouraria/CC'
+                ORDER BY RunDateTime DESC;
+            """
+            cursor.execute(sql_query)
+            return self._format_results(cursor)
+        except pyodbc.Error as ex:
+            st.error(f"Erro ao consultar o histórico de jobs: {ex}")
+            return []
+        finally:
+            cursor.close()
+
 # --- Funções e Interface da Aplicação Streamlit ---
 
 def display_json_or_text(content: str):
@@ -441,7 +488,8 @@ def init_connection():
             "tixlog": TixlogRepository(connection),
             "mclog": MclogRepository(connection),
             "mix100": Mix100Repository(connection),
-            "mclog_cct": MclogCctRepository(connection)
+            "mclog_cct": MclogCctRepository(connection),
+            "job": JobRepository(connection)
         }
         return st.session_state.repos
     except Exception as e:
@@ -489,7 +537,8 @@ repos = check_connection()
 st.sidebar.header("Navegação")
 app_mode = st.sidebar.radio(
     "Escolha a seção:",
-    ["Busca 360º", "Estatísticas"]
+    ["Busca 360º", "Estatísticas", "Monitoramento de Jobs"],
+    key="app_mode"
 )
 
 # --- LÓGICA DA PÁGINA DE BUSCA ---
@@ -829,5 +878,21 @@ elif app_mode == "Estatísticas":
                     st.dataframe(df_perf)
             else:
                 st.warning("Não foi possível obter dados para a análise de performance.")
+        else:
+            st.error("Conexão com o banco de dados não estabelecida.")
+# --- LÓGICA DA PÁGINA DE MONITORAMENTO DE JOBS ---
+elif app_mode == "Monitoramento de Jobs":
+    st.header("🤖 Monitoramento de Jobs do SQL Server")
+    
+    if st.button("Buscar Histórico de Jobs"):
+        if repos:
+            with st.spinner("Consultando histórico de jobs..."):
+                job_history = repos["job"].get_job_history()
+            
+            if job_history:
+                df_jobs = pd.DataFrame(job_history)
+                st.dataframe(df_jobs)
+            else:
+                st.info("Nenhum histórico encontrado para o job especificado.")
         else:
             st.error("Conexão com o banco de dados não estabelecida.")
